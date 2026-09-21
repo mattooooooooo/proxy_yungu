@@ -1,0 +1,13 @@
+[Unit]
+Description=Yungu multi-exit PAC file
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/gary/proxy_yungu
+ExecStart=/usr/bin/python3 /home/gary/proxy_yungu/pac_host.py --port 5008
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
