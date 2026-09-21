@@ -22,18 +22,5 @@ function FindProxyForURL(url, host) {
     var proxies = ["PROXY 10.0.165.45:8080", "PROXY 10.0.165.32:8080", "PROXY 10.0.165.30:8080"];
     var n = proxies.length;
     if (n === 0) return "DIRECT";
-    var client = "";
-    try { client = myIpAddress(); } catch (e) { client = ""; }
-    var key = host;
-    if (client && client !== "127.0.0.1") key = client + "|" + host;
-    var hash = 0;
-    for (i = 0; i < key.length; i++) {
-        hash = (hash * 31 + key.charCodeAt(i)) % 2147483647;
-    }
-    var start = hash % n;
-    var ordered = [];
-    for (i = 0; i < n; i++) {
-        ordered.push(proxies[(start + i) % n]);
-    }
-    return ordered.join("; ") + "; DIRECT";
+    return proxies.join("; ") + "; DIRECT";
 }

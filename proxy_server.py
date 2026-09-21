@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import socket
 import ssl
@@ -18,7 +19,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 HTTP_PORT = 8080
 HTTPS_PORT = 8443
@@ -28,9 +29,32 @@ BUFFER = 65536
 CONNECT_TIMEOUT = 10
 IDLE_TIMEOUT = 120
 ARP_TTL = 5.0
+HEALTH_INTERVAL = 2.0
+HEALTH_TIMEOUT = 2.5
+UNHEALTHY_AFTER = 2
+HEALTHY_AFTER = 1
+PROBE_TARGETS = (("1.1.1.1", 443), ("8.8.8.8", 443))
+CLASH_API_HOST = "127.0.0.1"
+CLASH_API_PORT = 9090
+CLASH_MIXED_PORT = 7890
+CLASH_SKIP_NODES = {
+    "DIRECT",
+    "REJECT",
+    "PASS",
+    "COMPATIBLE",
+    "GLOBAL",
+}
+_clash_mixed_ok = False
+_clash_mixed_checked = 0.0
+_fallback_peer: tuple[str, int] | None = None
+_clash_group = ""
+_clash_nodes: list[str] = []
+_clash_index = 0
+HOP_HEADER = "x-yungu-hop"
+MAX_G11_HOPS = 2
 
 DEFAULT_ALLOW_MACS = ("2c:ca:16:6f:fb:8d",)
-DEFAULT_ALLOW_IPS = ("10.0.166.11", "10.0.165.32", "127.0.0.1")
+DEFAULT_ALLOW_IPS = ("10.0.166.11",)
 DEFAULT_LOG = Path(__file__).with_name("proxy.log")
 _log_path: Path | None = DEFAULT_LOG
 _advertise_host = "127.0.0.1"
@@ -52,7 +76,7 @@ BYPASS_CONTAINS = (
     "dingtalk",
 )
 PAC_PATHS = {"/proxy.pac", "/wpad.dat"}
-BLOCKED_DOMAINS: set[str] = set()
+ROTATE_SECONDS = 5
 
 
 def log(msg: str) -> None:
@@ -63,25 +87,11 @@ def log(msg: str) -> None:
     with _log_path.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
 
-
 MAC_RE = re.compile(r"([0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5})", re.I)
 ARP_LINE_RE = re.compile(
     r"\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([0-9a-f:]{11,17})",
     re.I,
 )
-
-
-def is_blocked(host: str) -> bool:
-    host = (host or "").lower().split("%")[0].rstrip(".")
-    if not host:
-        return False
-    for b in BLOCKED_DOMAINS:
-        b = b.lower().strip()
-        if not b:
-            continue
-        if host == b or host.endswith("." + b) or b in host:
-            return True
-    return False
 
 
 def should_bypass(host: str) -> bool:
@@ -126,20 +136,7 @@ def build_pac(proxy_chain: list[tuple[str, int]]) -> str:
     var proxies = [{proxies_js}];
     var n = proxies.length;
     if (n === 0) return "DIRECT";
-    var client = "";
-    try {{ client = myIpAddress(); }} catch (e) {{ client = ""; }}
-    var key = host;
-    if (client && client !== "127.0.0.1") key = client + "|" + host;
-    var hash = 0;
-    for (i = 0; i < key.length; i++) {{
-        hash = (hash * 31 + key.charCodeAt(i)) % 2147483647;
-    }}
-    var start = hash % n;
-    var ordered = [];
-    for (i = 0; i < n; i++) {{
-        ordered.push(proxies[(start + i) % n]);
-    }}
-    return ordered.join("; ") + "; DIRECT";
+    return proxies.join("; ") + "; DIRECT";
 }}
 """
 
@@ -218,14 +215,74 @@ class ArpCache:
         return None
 
 
-def load_exits() -> list[dict]:
+def load_config() -> dict:
     if not EXITS_FILE.exists():
-        return []
+        return {}
     try:
-        data = json.loads(EXITS_FILE.read_text(encoding="utf-8"))
+        return json.loads(EXITS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
-    return list(data.get("exits") or [])
+        return {}
+
+
+def load_exits() -> list[dict]:
+    return list(load_config().get("exits") or [])
+
+
+def load_name_maps() -> tuple[dict[str, str], dict[str, str]]:
+    mac_to_name: dict[str, str] = {}
+    ip_to_name: dict[str, str] = {}
+    data = load_config()
+    for key in ("exits", "clients"):
+        for item in data.get(key) or []:
+            name = (item.get("name") or "").strip()
+            if not name:
+                continue
+            mac = item.get("mac") or ""
+            ip = (item.get("ip") or "").strip()
+            if mac:
+                try:
+                    mac_to_name[normalize_mac(mac)] = name
+                except ValueError:
+                    pass
+            if ip:
+                ip_to_name[ip] = name
+    return mac_to_name, ip_to_name
+
+
+def label_for(ip: str = "", mac: str = "") -> str:
+    mac_to_name, ip_to_name = load_name_maps()
+    if mac:
+        try:
+            name = mac_to_name.get(normalize_mac(mac))
+            if name:
+                return name
+        except ValueError:
+            pass
+    if ip:
+        name = ip_to_name.get(ip)
+        if name:
+            return name
+    return ""
+
+
+def pool_allow_lists() -> tuple[list[str], list[str]]:
+    macs: list[str] = list(DEFAULT_ALLOW_MACS)
+    ips: list[str] = list(DEFAULT_ALLOW_IPS)
+    data = load_config()
+    for key in ("exits", "clients"):
+        for item in data.get(key) or []:
+            mac = item.get("mac") or ""
+            ip = (item.get("ip") or "").strip()
+            if mac:
+                try:
+                    macs.append(normalize_mac(mac))
+                except ValueError:
+                    pass
+            if ip:
+                ips.append(ip)
+    uniq_macs = list(dict.fromkeys(macs))
+    uniq_ips = list(dict.fromkeys(ips))
+    return uniq_macs, uniq_ips
 
 
 def remember_exit_ip(mac: str, ip: str) -> None:
@@ -270,6 +327,13 @@ def build_proxy_chain(local_ip: str, http_port: int, arp: ArpCache) -> list[tupl
     return chain
 
 
+def format_exit(ip: str, port: int) -> str:
+    name = label_for(ip=ip)
+    if name:
+        return f"{name} {ip}:{port}"
+    return f"{ip}:{port}"
+
+
 async def refresh_proxy_chain_loop(local_ip: str, http_port: int) -> None:
     global _proxy_chain, _advertise_host
     arp = ArpCache()
@@ -280,15 +344,23 @@ async def refresh_proxy_chain_loop(local_ip: str, http_port: int) -> None:
         if chain != last:
             _proxy_chain = chain
             last = chain
-            log("G11 出口: " + " / ".join(f"{h}:{p}" for h, p in chain) + " （PAC 按域名均分，挂了自动切）")
+            log("G11 出口: " + " / ".join(format_exit(h, p) for h, p in chain) + " （不通则换下一台）")
         await asyncio.sleep(15)
 
 
 class AccessControl:
-    def __init__(self, allow_macs: Iterable[str], allow_ips: Iterable[str]) -> None:
+    def __init__(
+        self,
+        allow_macs: Iterable[str],
+        allow_ips: Iterable[str],
+        mac_to_name: dict[str, str] | None = None,
+        ip_to_name: dict[str, str] | None = None,
+    ) -> None:
         self.allow_macs = {normalize_mac(m) for m in allow_macs}
         self.allow_ips = set(allow_ips)
         self.arp = ArpCache()
+        self.mac_to_name = mac_to_name or {}
+        self.ip_to_name = ip_to_name or {}
 
     def allowed(self, peer_ip: str) -> bool:
         if peer_ip in {"127.0.0.1", "::1"}:
@@ -299,8 +371,15 @@ class AccessControl:
         return bool(mac and mac in self.allow_macs)
 
     def describe(self, peer_ip: str) -> str:
-        mac = self.arp.mac_for(peer_ip) or "-"
-        return f"{peer_ip} ({mac})"
+        mac = self.arp.mac_for(peer_ip) or ""
+        name = self.mac_to_name.get(mac) if mac else ""
+        if not name:
+            name = self.ip_to_name.get(peer_ip, "")
+        if peer_ip in {"127.0.0.1", "::1"}:
+            return f"{name or '本机'} {peer_ip}"
+        if name:
+            return f"{name} {peer_ip}"
+        return f"{peer_ip} ({mac or '-'})"
 
 
 async def relay(a: asyncio.StreamReader, b: asyncio.StreamWriter) -> None:
@@ -336,11 +415,93 @@ async def pump(left_r, left_w, right_r, right_w) -> None:
                 pass
 
 
-async def open_remote(host: str, port: int):
-    return await asyncio.wait_for(
-        asyncio.open_connection(host, port),
+async def tcp_open(host: str, port: int, timeout: float) -> bool:
+    try:
+        _r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def clash_mixed_available() -> bool:
+    global _clash_mixed_ok, _clash_mixed_checked
+    now = time.monotonic()
+    if now - _clash_mixed_checked < 1.0:
+        return _clash_mixed_ok
+    _clash_mixed_checked = now
+    _clash_mixed_ok = await tcp_open(CLASH_API_HOST, CLASH_MIXED_PORT, 0.4)
+    return _clash_mixed_ok
+
+
+async def connect_via_http_proxy(
+    proxy_host: str,
+    proxy_port: int,
+    host: str,
+    port: int,
+    hop: str = "",
+):
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(proxy_host, proxy_port),
         timeout=CONNECT_TIMEOUT,
     )
+    target = f"{host}:{port}"
+    extra = f"{HOP_HEADER.title()}: {hop}\r\n" if hop else ""
+    writer.write(
+        (
+            f"CONNECT {target} HTTP/1.1\r\n"
+            f"Host: {target}\r\n"
+            f"{extra}"
+            "Proxy-Connection: keep-alive\r\n\r\n"
+        ).encode("ascii", errors="replace")
+    )
+    await writer.drain()
+    header = await asyncio.wait_for(read_http_headers(reader), timeout=CONNECT_TIMEOUT)
+    first = header.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+    if " 200 " not in first:
+        writer.close()
+        raise ConnectionError(f"upstream proxy CONNECT failed: {first}")
+    return reader, writer
+
+
+def parse_hop_ips(headers: dict[str, str]) -> list[str]:
+    raw = headers.get(HOP_HEADER) or ""
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+async def pick_fallback_peer(local_ip: str, exclude: Iterable[str] = ()) -> tuple[str, int] | None:
+    blocked = {local_ip, *exclude}
+    for ip, port in list(_proxy_chain):
+        if ip in blocked:
+            continue
+        if await tcp_open(ip, port, 1.0):
+            return ip, port
+    return None
+
+
+async def open_remote(host: str, port: int, hop_ips: Iterable[str] | None = None):
+    hops = [h for h in (hop_ips or []) if h]
+    local = _advertise_host
+    peer = _fallback_peer
+    if peer and peer[0] not in hops and len(hops) < MAX_G11_HOPS:
+        hop = ",".join(hops + [local])
+        name = label_for(ip=peer[0]) or peer[0]
+        log(f"[FALLBACK] {name} {peer[0]}:{peer[1]}")
+        return await connect_via_http_proxy(peer[0], peer[1], host, port, hop=hop)
+    if not hops and await clash_mixed_available() and _fallback_peer is None:
+        return await connect_via_http_proxy(CLASH_API_HOST, CLASH_MIXED_PORT, host, port)
+    if hops and await clash_mixed_available() and _fallback_peer is None:
+        return await connect_via_http_proxy(CLASH_API_HOST, CLASH_MIXED_PORT, host, port)
+    if _fallback_peer is None:
+        return await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=CONNECT_TIMEOUT,
+        )
+    raise ConnectionError("no healthy Clash node and no G11 fallback")
 
 
 async def read_http_headers(reader: asyncio.StreamReader, first: bytes = b"") -> bytes:
@@ -396,17 +557,6 @@ async def handle_http(
 
     if method == "CONNECT":
         host, port = parse_host_port(target, 443)
-        if is_blocked(host):
-            log(f"[BLOCKED] {peer} -> {host}:{port} (Disabled by admin policy)")
-            writer.write(
-                b"HTTP/1.1 403 Forbidden\r\n"
-                b"Connection: close\r\n"
-                b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
-                + f"Access to {host} is disabled by proxy policy.\n".encode("utf-8")
-            )
-            await writer.drain()
-            writer.close()
-            return
         if should_bypass(host):
             log(f"[BYPASS] {peer} -> {host}:{port} (use PAC so this goes DIRECT)")
             writer.write(
@@ -419,8 +569,9 @@ async def handle_http(
             writer.close()
             return
         log(f"[HTTPS CONNECT] {peer} -> {host}:{port}")
+        hops = parse_hop_ips(headers)
         try:
-            remote_r, remote_w = await open_remote(host, port)
+            remote_r, remote_w = await open_remote(host, port, hops)
         except Exception as exc:
             log(f"[HTTPS CONNECT FAIL] {peer} -> {host}:{port} ({type(exc).__name__}: {exc})")
             writer.write(
@@ -452,18 +603,6 @@ async def handle_http(
         await send_pac(writer)
         return
 
-    if is_blocked(host):
-        log(f"[BLOCKED] {peer} -> {host}:{port}{path} (Disabled by admin policy)")
-        writer.write(
-            b"HTTP/1.1 403 Forbidden\r\n"
-            b"Connection: close\r\n"
-            b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
-            + f"Access to {host} is disabled by proxy policy.\n".encode("utf-8")
-        )
-        await writer.drain()
-        writer.close()
-        return
-
     if should_bypass(host):
         log(f"[BYPASS] {peer} -> {host}:{port}{path} (use PAC so this goes DIRECT)")
         writer.write(
@@ -483,7 +622,7 @@ async def handle_http(
         return
 
     try:
-        remote_r, remote_w = await open_remote(host, port)
+        remote_r, remote_w = await open_remote(host, port, parse_hop_ips(headers))
     except Exception as exc:
         writer.write(
             b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
@@ -557,13 +696,6 @@ async def handle_socks5(
         writer.close()
         return
     port = int.from_bytes(await reader.readexactly(2), "big")
-    if is_blocked(host):
-        log(f"[BLOCKED] {peer} -> {host}:{port} (SOCKS - Disabled by admin policy)")
-        writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
-        await writer.drain()
-        writer.close()
-        return
-
     if should_bypass(host):
         log(f"[BYPASS] {peer} -> {host}:{port} (SOCKS)")
         writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -572,7 +704,7 @@ async def handle_socks5(
         return
 
     try:
-        remote_r, remote_w = await open_remote(host, port)
+        remote_r, remote_w = await open_remote(host, port, [_advertise_host] if _fallback_peer else [])
     except Exception:
         writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
         await writer.drain()
@@ -685,6 +817,167 @@ async def serve(
     )
 
 
+async def probe_outbound() -> bool:
+    if await clash_mixed_available():
+        for host, port in PROBE_TARGETS:
+            try:
+                _r, writer = await connect_via_http_proxy(CLASH_API_HOST, CLASH_MIXED_PORT, host, port)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                continue
+        return False
+    for host, port in PROBE_TARGETS:
+        if await tcp_open(host, port, HEALTH_TIMEOUT):
+            return True
+    return False
+
+
+async def clash_api(method: str, path: str, payload: dict | None = None, timeout: float = 5.0):
+    body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+    headers = [
+        f"{method} {path} HTTP/1.1",
+        f"Host: {CLASH_API_HOST}:{CLASH_API_PORT}",
+        "Connection: close",
+    ]
+    secret = os.environ.get("CLASH_SECRET", "")
+    if secret:
+        headers.append(f"Authorization: Bearer {secret}")
+    if payload is not None:
+        headers.append("Content-Type: application/json")
+        headers.append(f"Content-Length: {len(body)}")
+    raw_req = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii") + body
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(CLASH_API_HOST, CLASH_API_PORT),
+        timeout=timeout,
+    )
+    writer.write(raw_req)
+    await writer.drain()
+    raw = await asyncio.wait_for(reader.read(2_000_000), timeout=timeout)
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+    head, _, rest = raw.partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+    parts = status_line.split()
+    code = int(parts[1]) if len(parts) > 1 else 0
+    data = None
+    if rest.strip():
+        try:
+            data = json.loads(rest.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            data = None
+    return code, data
+
+
+def clash_collect_nodes(proxies: dict, group: str, seen: set[str] | None = None) -> list[str]:
+    seen = seen if seen is not None else set()
+    if group in seen:
+        return []
+    seen.add(group)
+    info = proxies.get(group) or {}
+    nodes: list[str] = []
+    for name in info.get("all") or []:
+        if name in CLASH_SKIP_NODES or name in seen:
+            continue
+        child = proxies.get(name) or {}
+        kind = str(child.get("type") or "").lower()
+        if kind in {"selector", "url-test", "urltest", "fallback", "loadbalance", "relay"}:
+            nodes.extend(clash_collect_nodes(proxies, name, seen))
+        else:
+            nodes.append(name)
+    return list(dict.fromkeys(nodes))
+
+
+def clash_pick_group(proxies: dict) -> str:
+    names = list(proxies.keys())
+    for name in names:
+        if "选择节点" in name and str((proxies.get(name) or {}).get("type") or "").lower() == "selector":
+            return name
+    global_info = proxies.get("GLOBAL") or {}
+    if str(global_info.get("type") or "").lower() == "selector":
+        return "GLOBAL"
+    for name, info in proxies.items():
+        if str(info.get("type") or "").lower() == "selector" and name != "GLOBAL":
+            return name
+    return ""
+
+
+async def clash_switch_node(group: str, node: str) -> bool:
+    code, _ = await clash_api("PUT", "/proxies/" + quote(group, safe=""), {"name": node})
+    return 200 <= code < 300
+
+
+async def clash_load_nodes() -> bool:
+    global _clash_group, _clash_nodes, _clash_index
+    if not await tcp_open(CLASH_API_HOST, CLASH_API_PORT, 0.4):
+        return False
+    try:
+        code, data = await clash_api("GET", "/proxies")
+    except Exception as exc:
+        log(f"[CLASH] 读不到接口: {type(exc).__name__}: {exc}")
+        return False
+    proxies = (data or {}).get("proxies") or {}
+    if code != 200 or not proxies:
+        return False
+    group = clash_pick_group(proxies)
+    if not group:
+        return False
+    nodes = clash_collect_nodes(proxies, group)
+    if not nodes:
+        return False
+    current = (proxies.get(group) or {}).get("now") or ""
+    _clash_group = group
+    _clash_nodes = nodes
+    if current in nodes:
+        _clash_index = nodes.index(current)
+    elif _clash_index >= len(nodes):
+        _clash_index = 0
+    return True
+
+
+async def clash_goto_next(reason: str) -> str | None:
+    global _clash_index
+    if not _clash_nodes and not await clash_load_nodes():
+        return None
+    if not _clash_nodes:
+        return None
+    _clash_index = (_clash_index + 1) % len(_clash_nodes)
+    node = _clash_nodes[_clash_index]
+    try:
+        await clash_switch_node(_clash_group, node)
+    except Exception:
+        pass
+    log(f"[CLASH] {reason} -> {node}")
+    await asyncio.sleep(0.25)
+    return node
+
+
+async def clash_find_working_node() -> bool:
+    if not await clash_load_nodes():
+        return False
+    for _ in range(len(_clash_nodes)):
+        await clash_goto_next("节点不通")
+        if await probe_outbound():
+            return True
+    return False
+
+
+async def clash_rotate_loop() -> None:
+    while True:
+        await asyncio.sleep(ROTATE_SECONDS)
+        if _fallback_peer is not None:
+            continue
+        await clash_load_nodes()
+        await clash_goto_next("5秒轮换")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LAN HTTP + SOCKS5 proxy")
     parser.add_argument("--listen", default="0.0.0.0", help="bind address")
@@ -704,12 +997,6 @@ def parse_args() -> argparse.Namespace:
         help="source IP allowed to use the proxy (repeatable)",
     )
     parser.add_argument(
-        "--block-domain",
-        action="append",
-        default=[],
-        help="domain to block/disable egress (repeatable, e.g. --block-domain google)",
-    )
-    parser.add_argument(
         "--log-file",
         default=str(DEFAULT_LOG),
         help="append access logs to this file",
@@ -718,15 +1005,18 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main() -> None:
-    global _log_path, _advertise_host, _advertise_http_port, _proxy_chain, BLOCKED_DOMAINS
+    global _log_path, _advertise_host, _advertise_http_port, _proxy_chain, _fallback_peer
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     args = parse_args()
     _log_path = Path(args.log_file) if args.log_file else None
-    allow_macs = args.allow_mac or list(DEFAULT_ALLOW_MACS)
-    allow_ips = args.allow_ip or list(DEFAULT_ALLOW_IPS)
-    access = AccessControl(allow_macs, allow_ips)
-    BLOCKED_DOMAINS = {d.strip().lower() for d in args.block_domain if d.strip()}
+    allow_macs = list(args.allow_mac) if args.allow_mac else []
+    allow_ips = list(args.allow_ip) if args.allow_ip else []
+    pool_macs, pool_ips = pool_allow_lists()
+    allow_macs = list(dict.fromkeys([*pool_macs, *allow_macs]))
+    allow_ips = list(dict.fromkeys([*pool_ips, *allow_ips]))
+    mac_to_name, ip_to_name = load_name_maps()
+    access = AccessControl(allow_macs, allow_ips, mac_to_name, ip_to_name)
     lan_ips = local_ipv4s()
     shown_ip = lan_ips[0] if lan_ips else "本机局域网IP"
     _advertise_host = shown_ip
@@ -737,6 +1027,7 @@ async def main() -> None:
     socks_server = await serve(args.listen, args.socks_port, access, "socks")
     ssl_ctx = ensure_proxy_ssl_context(lan_ips + ["localhost"])
     https_server = await serve(args.listen, args.https_port, access, "http", ssl_ctx)
+    servers: list[asyncio.AbstractServer] = [http_server, https_server, socks_server]
 
     log("出口代理已启动")
     log(f"  本机局域网地址: {', '.join(lan_ips) or '未知'}")
@@ -744,26 +1035,85 @@ async def main() -> None:
     log(f"  HTTPS 代理:     {shown_ip}:{args.http_port}  （系统设置填这个，CONNECT）")
     log(f"  HTTPS(TLS):     https://{shown_ip}:{args.https_port}  （连代理本身也加密）")
     log(f"  SOCKS5:         {shown_ip}:{args.socks_port}")
-    log(f"  允许 MAC:       {', '.join(normalize_mac(m) for m in allow_macs)}")
-    log(f"  允许 IP:        {', '.join(allow_ips)} （本机 127.0.0.1 也可测）")
-    if BLOCKED_DOMAINS:
-        log(f"  已禁用出口域名: {', '.join(sorted(BLOCKED_DOMAINS))} （访问将被 403 阻断）")
+    log(f"  允许设备:       {', '.join(label_for(mac=m) or m for m in allow_macs)}")
     log(f"  日志文件:       {_log_path}")
     log("源设备请改用自动代理（PAC），钉钉 / task.yungu.org 才会直连：")
     log(f"  PAC 地址:   http://{shown_ip}:{args.http_port}/proxy.pac")
     if _proxy_chain:
-        log("  G11 出口: " + " / ".join(f"{h}:{p}" for h, p in _proxy_chain) + " （按域名均分，挂了自动切）")
+        log("  G11 出口: " + " / ".join(format_exit(h, p) for h, p in _proxy_chain) + " （不通则换下一台）")
     log("  关掉手动 HTTP/HTTPS 代理，改成「自动」并填上面的 PAC")
     log("  三台 G11 都要跑 ./start.sh，G10 流量才会均分；某台关掉会切到另外两台")
+    log(f"  Clash 每 {ROTATE_SECONDS} 秒切下一个节点；不通立刻切；全部不通再走其他 G11")
     log("按 Ctrl+C 停止。")
 
-    async with http_server, https_server, socks_server:
+    async def start_listeners() -> None:
+        http_s = await serve(args.listen, args.http_port, access, "http")
+        socks_s = await serve(args.listen, args.socks_port, access, "socks")
+        https_s = await serve(args.listen, args.https_port, access, "http", ssl_ctx)
+        servers[:] = [http_s, https_s, socks_s]
+        log("出口网络恢复，重新监听")
+
+    async def stop_listeners() -> None:
+        old = list(servers)
+        servers.clear()
+        for srv in old:
+            srv.close()
+        await asyncio.gather(*(srv.wait_closed() for srv in old), return_exceptions=True)
+
+    async def health_loop() -> None:
+        global _fallback_peer
+        fails = 0
+        oks = 0
+        up = True
+        while True:
+            ok = await probe_outbound()
+            if ok:
+                oks += 1
+                fails = 0
+                if _fallback_peer is not None:
+                    log("本机 Clash 恢复，不再走其他 G11")
+                    _fallback_peer = None
+                if not up and oks >= HEALTHY_AFTER:
+                    await start_listeners()
+                    up = True
+            else:
+                fails += 1
+                oks = 0
+                if _fallback_peer is not None:
+                    if fails % 15 == 0 and await clash_find_working_node():
+                        log("本机 Clash 恢复，不再走其他 G11")
+                        _fallback_peer = None
+                        fails = 0
+                    continue
+                if await clash_find_working_node():
+                    fails = 0
+                    oks = 1
+                    _fallback_peer = None
+                    if not up:
+                        await start_listeners()
+                        up = True
+                    continue
+                if up:
+                    peer = await pick_fallback_peer(shown_ip)
+                    if peer:
+                        _fallback_peer = peer
+                        name = format_exit(peer[0], peer[1])
+                        log(f"本机 Clash 全不通，改走 {name}")
+                        fails = 0
+                        continue
+                    log("出口网络差且没有其他 G11，暂停 8080")
+                    await stop_listeners()
+                    up = False
+            await asyncio.sleep(HEALTH_INTERVAL)
+
+    try:
         await asyncio.gather(
-            http_server.serve_forever(),
-            https_server.serve_forever(),
-            socks_server.serve_forever(),
+            health_loop(),
             refresh_proxy_chain_loop(shown_ip, args.http_port),
+            clash_rotate_loop(),
         )
+    finally:
+        await stop_listeners()
 
 
 if __name__ == "__main__":

@@ -1,13 +1,6 @@
-# Logs
-proxy.log
-*.log
-
-# Python cache
 __pycache__/
 *.py[cod]
-
-# TLS Certificates (自签证书不上传，每台机器自己生成)
-certs/
-
-# macOS
 .DS_Store
+proxy.log
+*.log
+certs/
