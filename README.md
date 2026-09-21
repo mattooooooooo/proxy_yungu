@@ -12,7 +12,8 @@ G11 多出口代理 + Clash Verge 自动切换脚本
 | `pac_host.py` | 独立 PAC 文件 HTTP 服务器（可选） |
 | `proxy-pac.service` | Linux systemd 服务文件（可选） |
 | `start.sh` | 快速启动脚本 |
-| `clash_auto_switch.py` | Clash Verge 自动最优节点切换脚本 |
+| `clash_auto_switch.py` | Clash Verge 自动最优节点切换脚本（Python 独立进程版） |
+| `Script.js` | Clash Verge 全局扩展脚本（原生 URLTest 自动最优，支持全局与规则模式） |
 
 ---
 
@@ -75,3 +76,17 @@ python3 clash_auto_switch.py
 | `CHECK_INTERVAL` | `30` | 检测间隔（秒） |
 | `SELECTOR_NAME` | `🔰 选择节点` | 策略组名字 |
 | `SKIP_KEYWORDS` | 下载专用/免费 | 跳过这些节点 |
+
+---
+
+## Clash Verge 全局扩展脚本（`Script.js`，推荐）
+
+无需运行任何外部 Python 脚本，直接由 Clash Verge / Mihomo 内核在底层原生每 30 秒测速并切到最快节点。
+
+- **兼容模式**：**规则模式 (Rule)** 与 **全局模式 (Global)** 均自动生效。
+- **直连保护**：自动注入 `yungu.org` 校园网、钉钉、小米等内网域名直连规则，防止误走外网。
+- **使用方法**：
+  1. 打开 Clash Verge -> 左侧「订阅」-> 顶部「全局扩展脚本」；
+  2. 将仓库中 `Script.js` 的完整内容复制并粘贴进去；
+  3. 保存并刷新配置即可。在代理列表顶部将自动出现 **`⚡ 30s自动最优`**。
+
